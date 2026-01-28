@@ -42,23 +42,32 @@ class VoidDetectionDataGenerator(keras.utils.Sequence):
     """Générateur de données avec augmentation"""
     
     def __init__(self, image_paths, label_paths, batch_size=8, img_size=(512, 512), 
-                 augment=True, shuffle=True):
+                 augment=True, shuffle=True, augment_factor=1):
         self.image_paths = image_paths
         self.label_paths = label_paths
         self.batch_size = batch_size
         self.img_size = img_size
         self.augment = augment
         self.shuffle = shuffle
-        self.indexes = np.arange(len(self.image_paths))
+        self.augment_factor = augment_factor  # Multiplier virtuel du dataset
+        
+        # Multiplier les indexes si augment_factor > 1
+        if augment and augment_factor > 1:
+            # Répéter chaque index augment_factor fois
+            self.indexes = np.repeat(np.arange(len(self.image_paths)), augment_factor)
+        else:
+            self.indexes = np.arange(len(self.image_paths))
+        
         self.on_epoch_end()
         
     def __len__(self):
-        return int(np.ceil(len(self.image_paths) / self.batch_size))
+        return int(np.ceil(len(self.indexes) / self.batch_size))
     
     def __getitem__(self, index):
         indexes = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
-        batch_images = [self.image_paths[k] for k in indexes]
-        batch_labels = [self.label_paths[k] for k in indexes]
+        # Utiliser modulo pour gérer les indexes répétés
+        batch_images = [self.image_paths[k % len(self.image_paths)] for k in indexes]
+        batch_labels = [self.label_paths[k % len(self.label_paths)] for k in indexes]
         
         X, y = self._generate_data(batch_images, batch_labels)
         return X, y
@@ -285,28 +294,75 @@ def prepare_dataset():
     return train_imgs, val_imgs, train_labels, val_labels
 
 
-def train_model(epochs=100, batch_size=4, img_size=(512, 512)):
-    """Entraîne le modèle"""
+def train_model(epochs=50, batch_size=2, img_size=(384, 384), small_dataset=True):
+    """
+    Entraîne le modèle
+    
+    Args:
+        epochs: Nombre d'époques (50 par défaut pour petit dataset)
+        batch_size: Taille du batch (2 par défaut pour petit dataset)
+        img_size: Taille des images (384x384 pour rapidité)
+        small_dataset: Si True, optimise pour <20 images
+    """
     
     print("Préparation du dataset...")
     train_imgs, val_imgs, train_labels, val_labels = prepare_dataset()
     
-    # Générateurs de données
-    train_gen = VoidDetectionDataGenerator(
-        train_imgs, train_labels, 
-        batch_size=batch_size, 
-        img_size=img_size, 
-        augment=True
-    )
+    num_images = len(train_imgs) + len(val_imgs)
+    print(f"\n📊 Dataset: {num_images} images au total")
     
-    val_gen = VoidDetectionDataGenerator(
-        val_imgs, val_labels, 
-        batch_size=batch_size, 
-        img_size=img_size, 
-        augment=False
-    )
+    # Adapter les paramètres selon la taille du dataset
+    if small_dataset or num_images < 20:
+        print("⚡ Mode PETIT DATASET détecté - Optimisations activées")
+        
+        # Augmentation INTENSIVE pour compenser le manque de données
+        train_gen = VoidDetectionDataGenerator(
+            train_imgs, train_labels, 
+            batch_size=batch_size, 
+            img_size=img_size, 
+            augment=True,
+            augment_factor=5  # Chaque image générée 5 fois par epoch
+        )
+        
+        # Validation sans augmentation
+        val_gen = VoidDetectionDataGenerator(
+            val_imgs, val_labels, 
+            batch_size=batch_size, 
+            img_size=img_size, 
+            augment=False
+        )
+        
+        # Learning rate plus élevé pour convergence rapide
+        learning_rate = 0.002
+        patience_early_stop = 10
+        patience_reduce_lr = 5
+        
+        print(f"   - Augmentation intensive: x5 par epoch")
+        print(f"   - Learning rate: {learning_rate}")
+        print(f"   - Early stopping: {patience_early_stop} epochs")
+        
+    else:
+        print("📈 Mode DATASET NORMAL")
+        
+        train_gen = VoidDetectionDataGenerator(
+            train_imgs, train_labels, 
+            batch_size=batch_size, 
+            img_size=img_size, 
+            augment=True
+        )
+        
+        val_gen = VoidDetectionDataGenerator(
+            val_imgs, val_labels, 
+            batch_size=batch_size, 
+            img_size=img_size, 
+            augment=False
+        )
+        
+        learning_rate = 0.001
+        patience_early_stop = 15
+        patience_reduce_lr = 7
     
-    print(f"Images d'entraînement: {len(train_imgs)}")
+    print(f"\nImages d'entraînement: {len(train_imgs)}")
     print(f"Images de validation: {len(val_imgs)}")
     
     # Construire le modèle
@@ -315,7 +371,7 @@ def train_model(epochs=100, batch_size=4, img_size=(512, 512)):
     
     # Compiler
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
         loss=combined_loss,
         metrics=['accuracy', dice_coefficient]
     )
@@ -334,7 +390,7 @@ def train_model(epochs=100, batch_size=4, img_size=(512, 512)):
     
     early_stop = EarlyStopping(
         monitor='val_loss',
-        patience=15,
+        patience=patience_early_stop,
         restore_best_weights=True,
         verbose=1
     )
@@ -342,7 +398,7 @@ def train_model(epochs=100, batch_size=4, img_size=(512, 512)):
     reduce_lr = ReduceLROnPlateau(
         monitor='val_loss',
         factor=0.5,
-        patience=7,
+        patience=patience_reduce_lr,
         min_lr=1e-7,
         verbose=1
     )
@@ -416,12 +472,25 @@ if __name__ == "__main__":
     print("ENTRAÎNEMENT DU MODÈLE DE DÉTECTION DE VOIDS")
     print("="*60)
     
+    # CONFIGURATION POUR PETIT DATASET (10 images)
+    # Optimisé pour convergence rapide avec peu de données
     model, history = train_model(
-        epochs=100,
-        batch_size=4,
-        img_size=(512, 512)
+        epochs=50,              # Réduit de 100 à 50 (convergence plus rapide)
+        batch_size=2,           # Réduit de 4 à 2 (moins de mémoire, plus stable)
+        img_size=(384, 384),    # Réduit de 512 à 384 (25% plus rapide)
+        small_dataset=True      # Active l'augmentation intensive
     )
+    
+    # Si vous avez plus de 20 images, utilisez:
+    # model, history = train_model(
+    #     epochs=100,
+    #     batch_size=4,
+    #     img_size=(512, 512),
+    #     small_dataset=False
+    # )
     
     print("\n" + "="*60)
     print("ENTRAÎNEMENT TERMINÉ!")
     print("="*60)
+    print("\n⏱️  Durée estimée avec 10 images: 15-20 minutes (GPU Colab)")
+    print("📁 Modèle sauvegardé dans: models/void_detection_best.h5")
